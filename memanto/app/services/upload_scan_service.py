@@ -37,9 +37,12 @@ TEXT_UPLOAD_SUFFIXES = frozenset({".txt", ".csv", ".json", ".md"})
 # object.
 _CHUNK_SIZE = 1024 * 1024  # 1 MB
 # A payload can straddle a chunk boundary. Carry the tail of each window so
-# such a match is found on the next iteration. This is a fixed upper bound,
-# not a heuristic about payload length: it just needs to cover the longest
-# possible match, which is well under 255 bytes.
+# such a match is found on the next iteration. 255 bytes covers the literal
+# form of every rule here (longest literal is 28 bytes). It is a practical
+# bound, not a guarantee: rules using unbounded quantifiers (`\s+`, `.*`) can
+# produce a match longer than the overlap, so a payload straddling a boundary
+# with more than 255 bytes of intervening whitespace is not detected. Accepted:
+# these rules guard against verbatim payloads, and any paraphrase evades them.
 _OVERLAP = 255
 
 
