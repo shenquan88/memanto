@@ -7,6 +7,12 @@ returned into LLM prompts on recall/answer/daily summary. A .md/.txt/.csv/
 horse vector that INJECTION_PATTERNS already blocks on every JSON write
 path. Binary formats (pdf/docx/xlsx) are extracted server-side and are not
 text-scannable at the route layer, so they remain a documented follow-up.
+
+Scanning is chunked and streaming: the file is read in fixed-size chunks
+with a carry-over overlap so a payload straddling a chunk boundary still
+matches, and memory is bounded no matter how large the upload is. Failing
+closed on any match is intentional: for a memory store the safe direction
+on failure is "reject the write", not "write the poison".
 """
 
 from __future__ import annotations
@@ -26,10 +32,25 @@ _INJECTION_RULES = tuple(
 # Everything else (pdf, docx, xlsx) is extracted server-side by Moorcheh.
 TEXT_UPLOAD_SUFFIXES = frozenset({".txt", ".csv", ".json", ".md"})
 
-# Directive payloads are short; reading more than this costs time without
-# gaining coverage. Bounded keeps a 5 GB .txt from being read line-by-line
-# to no additional effect.
-_TEXT_SCAN_MAX_BYTES = 1_048_576  # 1 MB
+# Chunked streaming scan, bounded memory: the whole file is walked in
+# _CHUNK_SIZE-byte reads, so a multi-GB .txt does not allocate a whole-file
+# object.
+_CHUNK_SIZE = 1024 * 1024  # 1 MB
+# A payload can straddle a chunk boundary. Carry the tail of each window so
+# such a match is found on the next iteration. This is a fixed upper bound,
+# not a heuristic about payload length: it just needs to cover the longest
+# possible match, which is well under 255 bytes.
+_OVERLAP = 255
+
+
+def _windows(lowered_chunks):
+    """Yield each lowercased chunk together with the carried tail of the
+    previous window, so a pattern that spans a chunk boundary is still
+    inside one of the windows we test."""
+    carry = ""
+    for chunk in lowered_chunks:
+        yield carry + chunk
+        carry = chunk[-_OVERLAP:]
 
 
 def scan_upload_for_injections(path: Path) -> list[str]:
@@ -45,11 +66,24 @@ def scan_upload_for_injections(path: Path) -> list[str]:
         return []
 
     matched: list[str] = []
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        text = f.read(_TEXT_SCAN_MAX_BYTES)
-
-    lowered = text.lower()
-    for pattern, compiled in zip(INJECTION_PATTERNS, _INJECTION_RULES):
-        if compiled.search(lowered):
-            matched.append(pattern)
+    seen = set()
+    with open(path, "rb") as f:
+        for window in _windows(_chunk_stream(f, _CHUNK_SIZE)):
+            for pattern, compiled in zip(INJECTION_PATTERNS, _INJECTION_RULES):
+                if pattern in seen:
+                    continue
+                if compiled.search(window):
+                    # Dedupe: the same rule can re-match on the carried
+                    # overlap across consecutive windows.
+                    seen.add(pattern)
+                    matched.append(pattern)
     return matched
+
+
+def _chunk_stream(f, chunk_size: int):
+    """Read fixed-size chunks from an open binary stream, lowercased."""
+    while True:
+        chunk = f.read(chunk_size)
+        if not chunk:
+            break
+        yield chunk.decode("utf-8", errors="replace").lower()
