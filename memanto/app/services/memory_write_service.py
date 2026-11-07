@@ -3,6 +3,7 @@ Memory Write Service
 """
 
 from datetime import datetime, timezone
+import re
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -112,6 +113,37 @@ class MemoryWriteService:
         memory.created_at = now
         memory.updated_at = now
 
+    def _validate_no_injection_payloads(self, memory: MemoryRecord) -> None:
+        """
+        Reject memory content or title matching the shared injection rule set
+        before the document reaches the storage layer.
+
+        The extraction path (``ConversationMemoryExtractionService._normalize_candidates``)
+        already drops directive-shaped candidates via ``INJECTION_PATTERNS``.
+        Without the same guard on the direct write path, an attacker-supplied
+        payload (e.g. smuggled through a file upload or an agent that mirrors
+        untrusted text verbatim into ``content``) persists into the document
+        text and is later returned into LLM prompts on recall/answer/daily
+        summary - the "memory as trojan horse" vector from the #1852 threat
+        model.
+
+        Rejection is a hard failure (not a silent drop) because this path is
+        an explicit write: the caller gets a 4xx and can inspect the reason.
+        """
+        from memanto.app.constants import INJECTION_PATTERNS
+
+        lowered_content = memory.content.lower()
+        lowered_title = memory.title.lower()
+        for pattern in INJECTION_PATTERNS:
+            if re.search(pattern, lowered_content) or re.search(
+                pattern, lowered_title
+            ):
+                raise MemoryOperationError(
+                    f"Memory content or title matches an injection directive "
+                    f"pattern (matching rule: {pattern!r}). Payload was not "
+                    f"persisted. Remove the directive text and retry."
+                )
+
     def store_memory(
         self, memory: MemoryRecord, context: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -126,6 +158,9 @@ class MemoryWriteService:
 
             # Auto parse memory type
             memory = self._parser.parse_memory(memory)
+
+            # Reject directive-shaped payloads before they reach storage
+            self._validate_no_injection_payloads(memory)
 
             # Add namespace
             namespace = memory.namespace()
@@ -205,6 +240,23 @@ class MemoryWriteService:
                     self._apply_timestamps(memory, now)
 
                     memory = self._parser.parse_memory(memory)
+
+                    # Reject directive-shaped payloads (same rule set as the
+                    # extraction path) before the batch reaches storage.
+                    # Failures are recorded per-memory; the batch continues.
+                    try:
+                        self._validate_no_injection_payloads(memory)
+                    except MemoryOperationError as e:
+                        results.append(
+                            {
+                                "id": memory.id,
+                                "status": "failed",
+                                "action": "rejected",
+                                "reason": str(e),
+                                "error": str(e),
+                            }
+                        )
+                        continue
 
                     # Add namespace
                     namespace = memory.namespace()
