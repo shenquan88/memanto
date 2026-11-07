@@ -128,7 +128,10 @@ class MemoryWriteService:
         model.
 
         Rejection is a hard failure (not a silent drop) because this path is
-        an explicit write: the caller gets a 4xx and can inspect the reason.
+        an explicit write: the error surfaces to the HTTP caller (currently
+        HTTP 500 via ``map_error_to_http_exception`` in
+        ``memanto/app/utils/errors.py``; input-validation 4xx mapping is a
+        follow-up) and the message names the matching rule.
         """
         from memanto.app.constants import INJECTION_PATTERNS
 
@@ -483,6 +486,12 @@ class MemoryWriteService:
                 else:
                     updated_memory.created_at = raw_created
             updated_memory.updated_at = datetime.now(timezone.utc)
+
+            # Re-run the injection guard after all field resolution (tags
+            # validation already ran inside the MemoryRecord constructor, but
+            # content/title come from the raw update dict, not from validated
+            # request models, so the guard applies to the resolved record).
+            self._validate_no_injection_payloads(updated_memory)
 
             # Expiry stamp. An explicit lifecycle transition passes the stamp in
             # `updates` and owns it outright; any other edit preserves whatever
