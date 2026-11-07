@@ -487,11 +487,16 @@ class MemoryWriteService:
                     updated_memory.created_at = raw_created
             updated_memory.updated_at = datetime.now(timezone.utc)
 
-            # Re-run the injection guard after all field resolution (tags
-            # validation already ran inside the MemoryRecord constructor, but
-            # content/title come from the raw update dict, not from validated
-            # request models, so the guard applies to the resolved record).
-            self._validate_no_injection_payloads(updated_memory)
+            # Guard only the fields this call explicitly touches. A record may
+            # already carry a payload written before the guard existed, or via
+            # the (residual) upload-file path; lifecycle-only calls such as
+            # expire/restore/tag edits must not fail on that pre-existing text,
+            # or every such transition on an affected record would 500.
+            # Newly provided content/title are checked on the resolved record;
+            # when the call touches neither, nothing new is being written and
+            # no guard is needed.
+            if "content" in updates or "title" in updates:
+                self._validate_no_injection_payloads(updated_memory)
 
             # Expiry stamp. An explicit lifecycle transition passes the stamp in
             # `updates` and owns it outright; any other edit preserves whatever

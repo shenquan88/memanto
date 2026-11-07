@@ -964,6 +964,28 @@ async def upload_file(
                             },
                         )
                     await asyncio.to_thread(tmp.write, chunk)
+
+            # Pre-scan text-class uploads for directive payloads before they
+            # are embedded into document text. Binary formats (pdf/docx/xlsx)
+            # are extracted server-side and remain a documented follow-up.
+            from memanto.app.services.upload_scan_service import (
+                scan_upload_for_injections,
+            )
+
+            matched_rules = await asyncio.to_thread(
+                scan_upload_for_injections, Path(tmp_path)
+            )
+            if matched_rules:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "injection_payload_in_upload",
+                        "message": "Uploaded file contains text that matches "
+                        "injection directive patterns. The file was not stored.",
+                        "matched_rules": matched_rules,
+                    },
+                )
+
             result = await asyncio.to_thread(
                 client.documents.upload_file, namespace, tmp_path
             )
